@@ -4,123 +4,214 @@ console.log("EXTENSION LOADED", {
     jobCards: document.querySelectorAll("[data-job-id]").length
 });
 
-const jobResults = new Map();
+// =====================
+// GLOBAL STATE
+// =====================
 
-let isProcessing = false;
-let shouldProcessAgain = false;
-let cooldownUntil = 0;
+const jobResults = new Map();
 
 let observer = null;
 let observerStarted = false;
-let jobsModeActive = false;
+
+let scanGeneration = 0;
+let currentContextKey = "";
 let lastUrl = location.href;
+
+let queue = [];
+let queuedJobIds = new Set();
+let isWorkerRunning = false;
+
+let inflightControllers = new Map();
+
+let enqueueTimer = null;
+let cooldownUntil = 0;
 
 //=====================
 // MATCHER
 //=====================
 
-const restrictionPatterns = [
+const strongPositivePatterns = [
     {
-        label: "us citizen",
-        displayPhrase: "U.S. citizen",
-        regex: /\bu\.?s\.?\s+citizen(s)?\b/i
+        label: "must be a us citizen",
+        regex: /\bmust be (a )?u\.?s\.?\s+citizen\b/i
     },
     {
         label: "citizenship required",
-        displayPhrase: "citizenship required",
         regex: /\bcitizenship required\b/i
     },
     {
-        label: "must be a us citizen",
-        displayPhrase: "must be a U.S. citizen",
-        regex: /\bmust be a u\.?s\.?\s+citizen\b/i
+        label: "us citizenship required",
+        regex: /\bu\.?s\.?\s+citizenship required\b/i
     },
     {
-        label: "us citizen or permanent resident",
-        displayPhrase: "U.S. citizen or permanent resident",
-        regex: /\bu\.?s\.?\s+citizen\b[\s\S]{0,50}\b(permanent resident|green card holder)\b/i
+        label: "only us persons",
+        regex: /\bonly u\.?s\.?\s+person(s)?\b/i
     },
     {
-        label: "permanent resident",
-        displayPhrase: "permanent resident / green card holder",
-        regex: /\b(permanent resident|lawful permanent resident|green card holder)\b/i
+        label: "only us citizens",
+        regex: /\bonly u\.?s\.?\s+citizen(s)?\b/i
     },
-
     {
         label: "no sponsorship",
-        displayPhrase: "no sponsorship",
         regex: /\b(no|without)\s+sponsorship\b/i
     },
     {
         label: "will not sponsor",
-        displayPhrase: "will not sponsor",
         regex: /\b(will not|won't|cannot|unable to|do not)\s+sponsor\b/i
     },
     {
-        label: "sponsorship not provided",
-        displayPhrase: "sponsorship will not be provided",
-        regex: /\bsponsorship\b[\s\S]{0,80}\b(not|no|without)\b[\s\S]{0,40}\b(provided|available)\b/i
+        label: "sponsorship not available",
+        regex: /\bsponsorship\b[\s\S]{0,60}\b(not available|not provided|unavailable|cannot be provided|will not be provided)\b/i
     },
     {
-        label: "not eligible for hire",
-        displayPhrase: "not eligible for hire",
-        regex: /\bnot eligible for (hire|employment)\b/i
+        label: "not eligible for employment",
+        regex: /\bnot eligible for (hire|employment|this role|this position)\b/i
     },
     {
-        label: "temporary visa restriction",
-        displayPhrase: "temporary visa holders not eligible",
-        regex: /\b(f-1|opt|cpt|h-1b?|h-2|l-1|j-1|tn)\b[\s\S]{0,120}\b(not eligible|ineligible|cannot|restricted|not be considered)\b/i
+        label: "temporary visa holders not eligible",
+        regex: /\b(f-1|opt|cpt|h-1b?|h-2|l-1|j-1|tn)\b[\s\S]{0,100}\b(not eligible|ineligible|cannot be considered|will not be considered|not accepted|restricted)\b/i
     },
+    {
+        label: "citizens or permanent residents only",
+        regex: /\b(u\.?s\.?\s+citizen(s)?|citizen(s)?)\b[\s\S]{0,50}\b(permanent resident(s)?|green card holder(s)?|lawful permanent resident(s)?)\b[\s\S]{0,30}\b(only|required)\b/i
+    },
+    {
+        label: "active security clearance required",
+        regex: /\b(active\s+)?(secret|top\s+secret|ts\s*\/\s*sci)?\s*(security\s+)?clearance\b[\s\S]{0,25}\b(required|must have)\b/i
+    },
+    {
+        label: "must be a us person",
+        regex: /\bmust be (a )?u\.?s\.?\s+person\b/i
+    },
+    {
+        label: "export control us person required",
+        regex: /\bdue to (export control|it ar|itar|ear)\b[\s\S]{0,120}\b(u\.?s\.?\s+person|u\.?s\.?\s+citizen|permanent resident)\b[\s\S]{0,40}\b(required|only|must be)\b/i
+    }
+];
 
+const weakIndicatorPatterns = [
     {
         label: "us person",
-        displayPhrase: "U.S. person",
         regex: /\bu\.?s\.?\s+person(s)?\b/i
     },
     {
-        label: "only us persons",
-        displayPhrase: "only U.S. persons",
-        regex: /\bonly u\.?s\.?\s+person(s)?\b/i
-    },
-    {
         label: "security clearance",
-        displayPhrase: "security clearance",
         regex: /\b(active\s+)?(secret|top\s+secret|ts\s*\/\s*sci)?\s*(security\s+)?clearance\b/i
     },
     {
-        label: "security clearance required",
-        displayPhrase: "security clearance required",
-        regex: /\bsecurity clearance required\b/i
+        label: "permanent resident",
+        regex: /\b(permanent resident|lawful permanent resident|green card holder)\b/i
     },
     {
-        label: "active security clearance",
-        displayPhrase: "active security clearance",
-        regex: /\bactive\s+(secret\s+|top\s+secret\s+)?(security\s+)?clearance\b/i
+        label: "nationality",
+        regex: /\bnationality\b/i
     },
+    {
+        label: "citizenship status",
+        regex: /\bcitizenship status\b/i
+    },
+    {
+        label: "export control",
+        regex: /\b(export control|itar|ear)\b/i
+    }
 ];
 
-// making text more readable
-function normalizeMatchedText(text) {
+const negativeContextPatterns = [
+    /\bdefinition of u\.?s\.?\s+person\b/i,
+    /\bwhat is a u\.?s\.?\s+person\b/i,
+    /\bu\.?s\.?\s+person means\b/i,
+    /\bunder u\.?s\.?\s+export control laws\b/i,
+    /\bself[- ]?identify\b/i,
+    /\bvoluntary self[- ]?identification\b/i,
+    /\bcitizenship question\b/i,
+    /\bnationality question\b/i,
+    /\ball qualified applicants\b/i,
+    /\bequal opportunity employer\b/i,
+    /\bregardless of (race|color|religion|sex|national origin|citizenship)\b/i,
+    /\bsecurity clearance preferred\b/i,
+    /\bability to obtain\b/i,
+    /\bmay require\b/i,
+    /\bmay be required\b/i,
+    /\bif required by law\b/i
+];
+
+const requirementWordsRegex =
+    /\b(required|must|only|eligible|must have|need to|necessary|cannot|not eligible|required for this role|required for the position)\b/i;
+
+// making any sort of space into whitespace for better readibility
+function normalizeWhitespace(text) {
     return text.replace(/\s+/g, " ").trim();
 }
 
-function findRestriction(text) {
-    for (const pattern of restrictionPatterns) {
-        const match = text.match(pattern.regex);
+function splitIntoSentences(text) {
+    return normalizeWhitespace(text)
+        .split(/(?<=[.!?])\s+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
 
+function getTextFromDoc(doc) {
+    return normalizeWhitespace(doc.body?.textContent || "");
+}
+
+function getVisibleCardText(jobCard) {
+    return normalizeWhitespace(jobCard.textContent || "");
+}
+
+function findStrongMatchInText(text) {
+    for (const pattern of strongPositivePatterns) {
+        const match = text.match(pattern.regex);
         if (match) {
             return {
+                confidence: "high",
                 label: pattern.label,
-                phrase: normalizeMatchedText(match[0]),
-                displayPhrase: pattern.displayPhrase
+                phrase: normalizeWhitespace(match[0])
             };
         }
     }
     return null;
 }
 
+function findRestriction(text) {
+    if (!text) return null;
+
+    const normalized = normalizeWhitespace(text);
+    const sentences = splitIntoSentences(normalized);
+
+    for (const sentence of sentences) {
+        if (negativeContextPatterns.some((r) => r.test(sentence))) {
+            continue;
+        }
+
+        const strong = findStrongMatchInText(sentence);
+        if (strong) {
+            return strong;
+        }
+    }
+
+    for (const sentence of sentences) {
+        if (negativeContextPatterns.some((r) => r.test(sentence))) {
+            continue;
+        }
+
+        const weak = weakIndicatorPatterns.find((p) => p.regex.test(sentence));
+        if (!weak) continue;
+
+        if (requirementWordsRegex.test(sentence)) {
+            const weakMatch = sentence.match(weak.regex);
+            return {
+                confidence: "medium",
+                label: weak.label,
+                phrase: weakMatch ? normalizeWhitespace(weakMatch[0]) : normalizeWhitespace(sentence)
+            };
+        }
+    }
+
+    return null;
+}
+
 //=====================
-// DOM
+// DOM / PAGE CONTEXT
 //=====================
 
 function isJobsPage() {
@@ -136,13 +227,7 @@ function isRelevantJobsContext() {
 }
 
 function getJobCards() {
-    const cards = document.querySelectorAll('[data-job-id]');
-    console.log("getJobCards()", {
-        href: location.href,
-        top: window === top,
-        count: cards.length
-    });
-    return cards;
+    return Array.from(document.querySelectorAll('[data-job-id]'));
 }
 
 function markJobCard(jobId, source, phrase) {
@@ -151,7 +236,7 @@ function markJobCard(jobId, source, phrase) {
 
     if (job.querySelector('.citizenship-alert-badge')) return;
 
-    const badge = document.createElement(`span`);
+    const badge = document.createElement('span');
     badge.textContent = '⚠️';
     badge.className = 'citizenship-alert-badge';
     badge.style.marginLeft = '8px';
@@ -173,39 +258,157 @@ function markJobCard(jobId, source, phrase) {
     }
 }
 
-async function waitForJobCardsToAppear(timeoutMs = 15000) {
-    const start = Date.now();
+function reapplyBadgeFromCache(jobId) {
+    const cached = jobResults.get(jobId);
+    if (!cached || !cached.matched) return;
 
-    while (Date.now() - start < timeoutMs) {
-        const cards = document.querySelectorAll("[data-job-id]");
-
-        if (cards.length > 0) {
-            console.log("Job cards detected:", cards.length);
-            return true;
-        }
-
-        await sleep(300);
-    }
-
-    console.log("Timed out waiting for job cards");
-    return false;
+    markJobCard(jobId, cached.source, cached.phrase);
 }
 
-//=====================
-// SERVICES
-//=====================
+function removeAllBadges() {
+    document.querySelectorAll(".citizenship-alert-badge").forEach((el) => el.remove());
+}
+
+function getSearchParamValue(name) {
+    try {
+        const url = new URL(location.href);
+        return url.searchParams.get(name) || "";
+    } catch {
+        return "";
+    }
+}
+
+function getJobsContextKey() {
+    if (!isRelevantJobsContext()) return "NON_JOBS";
+
+    const pathname = location.pathname;
+    const keywords = getSearchParamValue("keywords");
+    const locationParam = getSearchParamValue("location");
+    const currentJobId = getSearchParamValue("currentJobId");
+    const fAL = getSearchParamValue("f_AL");
+    const f_E = getSearchParamValue("f_E");
+    const f_JT = getSearchParamValue("f_JT");
+    const f_WT = getSearchParamValue("f_WT");
+    const f_TPR = getSearchParamValue("f_TPR");
+    const sortBy = getSearchParamValue("sortBy");
+    const start = getSearchParamValue("start");
+
+    return JSON.stringify({
+        pathname,
+        keywords,
+        locationParam,
+        currentJobId,
+        fAL,
+        fE: f_E,
+        fJT: f_JT,
+        fWT: f_WT,
+        fTPR: f_TPR,
+        sortBy,
+        start
+    });
+}
+
+// =====================
+// QUEUE / CANCELLATION
+// =====================
+
+function isStale(generation) {
+    return generation !== scanGeneration;
+}
+
+function abortAllInflight() {
+    for (const controller of inflightControllers.values()) {
+        try {
+            controller.abort();
+        } catch {}
+    }
+    inflightControllers.clear();
+}
+
+function resetScannerForNewContext() {
+    scanGeneration++;
+    queue = [];
+    queuedJobIds.clear();
+    isWorkerRunning = false;
+    abortAllInflight();
+
+    console.log("Scanner reset for new context", {
+        scanGeneration,
+        href: location.href
+    });
+}
+
+function handlePossibleContextChange() {
+    const nextContextKey = getJobsContextKey();
+    if (nextContextKey === currentContextKey) return;
+
+    const prevParsed = currentContextKey === "NON_JOBS"? null : JSON.parse(currentContextKey);
+    const nextParsed = nextContextKey === "NON_JOBS" ? null : JSON.parse(nextContextKey);
+
+    const keysToCompare = ["pathname", "keywords", "locationParam", "fAL", "fE", "fJT", "fWT", "fTPR", "sortBy", "start"];
+
+    const onlyJobIdChanged =
+        prevParsed && nextParsed && keysToCompare.every((k) => prevParsed[k] === nextParsed[k]);
+
+    currentContextKey = nextContextKey;
+
+    if (!onlyJobIdChanged) {
+        resetScannerForNewContext();
+    }
+
+    if (isRelevantJobsContext()) {
+        scheduleEnqueueAndWork();
+    }
+}
+
+function enqueueVisibleJobs() {
+    if (!isRelevantJobsContext()) return;
+
+    const jobs = getJobCards();
+
+    for (const job of jobs) {
+        const jobId = job.getAttribute("data-job-id");
+        if (!jobId) continue;
+
+        if (jobResults.has(jobId)) {
+            reapplyBadgeFromCache(jobId);
+            continue;
+        }
+
+        if (queuedJobIds.has(jobId)) continue;
+
+        queuedJobIds.add(jobId);
+        queue.push(jobId);
+    }
+
+    console.log("Queue status", {
+        generation: scanGeneration,
+        queued: queue.length,
+        visibleCards: jobs.length
+    });
+}
+
+function scheduleEnqueueAndWork() {
+    clearTimeout(enqueueTimer);
+    
+    enqueueTimer = setTimeout(() => {
+        if (!isRelevantJobsContext()) return;
+        enqueueVisibleJobs();
+        startWorker(scanGeneration).catch(console.error);
+    }, 250);
+}
+
+// =====================
+// FETCH HELPERS
+// =====================
 
 function parseHtml(html) {
     const parser = new DOMParser();
     return parser.parseFromString(html, "text/html");
 }
 
-function getTextFromDoc(doc) {
-    return (doc.body?.textContent || "").toLowerCase();
-}
-
 function getCookie(name) {
-    const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'))
+    const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
     return match ? match[2]: null;
 }
 
@@ -216,15 +419,46 @@ function getCsrfToken() {
     return jsessionId.replace(/^"|"$/g, "");
 }
 
-async function fetchLinkedInJobPage(jobId) {
+function createAbortController(key) {
+    const controller = new AbortController();
+    inflightControllers.set(key, controller);
+    return controller;
+}
+
+function cleanupAbortController(key) {
+    inflightControllers.delete(key);
+}
+
+async function fetchWithAbort(url, options = {}, controllerKey) {
+    const controller = createAbortController(controllerKey);
+
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+        return response;
+    } finally {
+        cleanupAbortController(controllerKey);
+    }
+}
+
+async function fetchLinkedInJobPage(jobId, generation) {
+    if (isStale(generation)) throw new Error("Stale generation before LinkedIn page fetch");
+
     const url = `https://www.linkedin.com/jobs/search/?currentJobId=${jobId}`;
 
     let response;
     try {
-        response = await fetch(url, {
-            credentials: "include"
-        });
+        response = await fetchWithAbort(
+            url, 
+            { credentials: "include" },
+            `linkedin:${generation}:${jobId}`
+        );
     } catch (err) {
+        if (String(err).includes("AbortError")) {
+            throw err;
+        }
         throw new Error(`LinkedIn job page fetch threw before response for job ${jobId}: ${err}`);
     }
 
@@ -273,9 +507,10 @@ function extractVoyagerApplyInfo(data) {
     return null;
 }
 
-async function getVoyagerApplyInfo(jobId) {
-    const csrfToken = getCsrfToken();
+async function getVoyagerApplyInfo(jobId, generation) {
+    if (isStale(generation)) throw new Error("Stale generation before Voyager fetch");
 
+    const csrfToken = getCsrfToken();
     const encodedJobPostingUrn = `urn%3Ali%3Afsd_jobPosting%3A${jobId}`;
 
     const url =
@@ -285,14 +520,21 @@ async function getVoyagerApplyInfo(jobId) {
 
     let response;
     try {
-        response = await fetch(url, {
-            credentials: "include",
-            headers: {
-                "csrf-token": csrfToken,
-                "x-restli-protocol-version": "2.0.0"
-            }
-        });
+        response = await fetchWithAbort(
+            url, 
+            { 
+                credentials: "include",
+                headers: {
+                    "csrf-token": csrfToken,
+                    "x-restli-protocol-version": "2.0.0"
+                }
+            },
+            `voyager:${generation}:${jobId}`
+        );
     } catch (err) {
+        if (String(err).includes("AbortError")) {
+            throw err;
+        }
         throw new Error(`Voyager fetch threw before response for job ${jobId}: ${err}`);
     }
 
@@ -346,6 +588,7 @@ function fetchExternalPageViaBackground(url) {
     });
 }
 
+// remove a trailing slash
 function normalizeUrlForComparison(url) {
     try {
         const u = new URL(url);
@@ -377,28 +620,46 @@ function getAshbyRelatedUrls(url) {
 
         if (pathname.toLowerCase().endsWith("/application")) {
             const basePath = pathname.slice(0, -"/application".length);
-            console.log(`Adding normalized Ashbyhq url ${parsed.origin}${basePath} for ${url}`);
             urls.push(`${parsed.origin}${basePath}`);
         } 
-    } catch {
-
-    }
+    } catch {}
 
     return [...new Set(urls)];
 }
+function isLikelyWorthExternalCheck(applyInfo) {
+    if (!applyInfo?.url || !applyInfo.isExternal) return false;
 
-async function checkExternalApplyPage(applyUrl) {
+    try {
+        const host = new URL(applyInfo.url).hostname.toLowerCase();
+
+        return [
+            "ashbyhq.com",
+            "greenhouse.io",
+            "lever.co",
+            "workday.com",
+            "myworkdayjobs.com"
+        ].some((domain) => host === domain || host.endsWith(`.${domain}`));
+    } catch {
+        return true;
+    }
+}
+
+async function checkExternalApplyPage(applyUrl, generation) {
     const candidateUrls = getAshbyRelatedUrls(applyUrl);
 
     for (const url of candidateUrls) {
+        if (isStale(generation)) return null;
+
         try {
             const html = await fetchExternalPageViaBackground(url);
+
+            if (isStale(generation)) return null;
         
             console.log("Company Job Board:", url, html);
 
             const doc = parseHtml(html);
             const main = doc.querySelector('main');
-            const text = (main?.textContent || doc.body?.textContent || "").toLowerCase();
+            const text = normalizeWhitespace(main?.textContent || doc.body?.textContent || "");
         
             const match = findRestriction(text);
         
@@ -417,11 +678,15 @@ async function checkExternalApplyPage(applyUrl) {
     return null;
 }
 
+// =====================
+// RATE LIMIT / UTILS
+// =====================
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function randomDelay(min = 250, max = 500) {
+function randomDelay(min = 120, max = 240) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
@@ -439,18 +704,42 @@ async function handleRateLimit(err) {
     await sleep(cooldownMs);
 }
 
-function reapplyBadgeFromCache(jobId) {
-    const cached = jobResults.get(jobId);
-    if (!cached || !cached.matched) return;
+// =====================
+// JOB CHECKING
+// =====================
 
-    markJobCard(jobId, cached.source, cached.phrase);
-}
+// Workflow:
+// 1. Check visible card text first (cheap)
+// 2. Check LinkedIn page text (more complete)
+// 3. Only then ask Voyager for external apply URL
+// 4. Only fetch external page if the ATS/domain is worth checking
 
-async function checkJob(jobId) {
-    const { url: linkedinUrl, html } = await fetchLinkedInJobPage(jobId);
+async function checkJob(jobId, generation) {
+    if (isStale(generation)) return { stale: true };
+
+    const card = document.querySelector(`[data-job-id="${jobId}"]`);
+    if (card) {
+        const cardText = getVisibleCardText(card);
+        const cardMatch = findRestriction(cardText);
+
+        if (cardMatch && cardMatch.confidence === "high") {
+            return {
+                matched: true,
+                source: "linkedin",
+                phrase: cardMatch.phrase,
+                label: cardMatch.label,
+                url: location.href
+            };
+        }
+    }
+
+    const { url: linkedinUrl, html } = await fetchLinkedInJobPage(jobId, generation);
+
+    if (isStale(generation)) return { stale: true };
+
+
     const linkedinDoc = parseHtml(html);
     const linkedinText = getTextFromDoc(linkedinDoc);
-
     const linkedinMatch = findRestriction(linkedinText);
 
     if (linkedinMatch) {
@@ -463,114 +752,123 @@ async function checkJob(jobId) {
         };
     }
 
-    const applyInfo = await getVoyagerApplyInfo(jobId);
+    const applyInfo = await getVoyagerApplyInfo(jobId, generation);
 
-    if (!applyInfo) {
+    if (isStale(generation)) return { stale: true };
+
+    if (!applyInfo || !applyInfo.isExternal || !isLikelyWorthExternalCheck(applyInfo)) {
         return {
             matched: false
         };
     }
 
-    if (!applyInfo.isExternal) {
+    const externalMatch = await checkExternalApplyPage(applyInfo.url, generation);
+
+    if (isStale(generation)) return { stale: true };
+
+    if (externalMatch) {
         return {
-            matched: false
+            matched: true,
+            source: externalMatch.source,
+            phrase: externalMatch.phrase,
+            label: externalMatch.label,
+            url: externalMatch.url
         };
-    }
-
-    try {
-        const externalMatch = await checkExternalApplyPage(applyInfo.url);
-
-        if (externalMatch) {
-            return {
-                matched: true,
-                source: externalMatch.source,
-                phrase: externalMatch.phrase,
-                label: externalMatch.label,
-                url: externalMatch.url
-            };
-        }
-    } catch (err) {
-        console.log(`External page check failed for ${jobId}:`, err);
     }
 
     return { matched: false };
 }
 
-async function processVisibleJobs() {
-    if (!isRelevantJobsContext()) return;
+// =====================
+// WORKER
+// =====================
 
-
-
-    if (isProcessing) {
-        shouldProcessAgain = true;
-        return;
-    }
-
-    isProcessing = true;
+async function startWorker(generation) {
+    if (isWorkerRunning) return;
+    isWorkerRunning = true;
 
     try {
-        do {
-            shouldProcessAgain = false;
+        while (queue.length > 0) {
+            if (isStale(generation)) {
+                console.log("Worker stopping because generation is stale");
+                return;
+            }
 
             if (Date.now() < cooldownUntil) {
                 await sleep(cooldownUntil - Date.now());
+                if (isStale(generation)) return;
             }
 
-            const jobs = getJobCards();
-            
-            console.log("Processing jobs:", jobs.length);
-        
-            for (let i = 0; i < jobs.length; i++) {
-                const job = jobs[i];
-                const jobId = job.getAttribute("data-job-id");
-        
-                if (!jobId) continue;
-                if (jobResults.has(jobId)) {
-                    reapplyBadgeFromCache(jobId);
-                    continue;
+            const jobId = queue.shift();
+            queuedJobIds.delete(jobId);
+
+            if (!jobId) continue;
+            if (jobResults.has(jobId)) {
+                reapplyBadgeFromCache(jobId);
+                continue;
+            }
+
+            console.log(`Checking job ${jobId}`, { generation });
+
+            try {
+                const result = await checkJob(jobId, generation);
+
+                if (result?.stale || isStale(generation)) {
+                    console.log(`Ignoring stale result for ${jobId}`);
+                    return;
                 }
-        
-                console.log(`Checking job ${jobId}`);
-        
-                try {
-                    const result = await checkJob(jobId);
-                    jobResults.set(jobId, result);
-        
-                    if (result.matched) {
-                        console.log("Citizenship restriction FOUND");
-                        console.log("Source:", result.source);
-                        console.log("Matched label:", result.label);
-                        console.log("Matched phrase:", result.phrase);
-                        console.log(`LinkedIn Job ID: ${jobId}`);
-                        console.log("URL:", result.url);
-        
-                        markJobCard(jobId, result.source, result.phrase);
-                    } else {
-                        console.log(`No restriction detected for ${jobId}`);
-                    }
-                } catch (err) {
-                    console.error(`Failed to check job ${jobId}:`, err);
 
-                    await handleRateLimit(err);
+                jobResults.set(jobId, result);
 
+                if (result.matched) {
+                    console.log("Restriction FOUND", {
+                        jobId,
+                        source: result.source,
+                        label: result.label,
+                        phrase: result.phrase,
+                        url: result.url
+                    });
+
+                    markJobCard(jobId, result.source, result.phrase);
+                } else {
+                    console.log(`No restriction detected for ${jobId}`);
+                }
+            } catch (err) {
+                if (String(err).includes("AbortError")) {
+                    console.log(`Aborted job ${jobId}`);
+                    return;
+                }
+
+                console.error(`Failed to check job ${jobId}:`, err);
+                await handleRateLimit(err);
+
+                if (!isStale(generation)) {
                     jobResults.set(jobId, { matched: false, error: String(err) });
                 }
-
-                await sleep(randomDelay(250, 500));
             }
-        } while (shouldProcessAgain)
+
+            await sleep(randomDelay(120, 240));
+        }
     } finally {
-        isProcessing = false;
+        isWorkerRunning = false;
+
+        if (!isStale(generation) && queue.length > 0) {
+            startWorker(generation).catch(console.error);
+        }
     }
 }
+
+// =====================
+// OBSERVER / NAVIGATION
+// =====================
 
 function startObserver() {
     if (observerStarted || !document.body) return;
 
     observer = new MutationObserver(() => {
-        if (isRelevantJobsContext()) {
-            processVisibleJobs().catch(console.error);
-        }
+        if (!isRelevantJobsContext()) return;
+
+        scheduleEnqueueAndWork();
     });
 
     observer.observe(document.body, {
@@ -581,60 +879,55 @@ function startObserver() {
     observerStarted = true;
 }
 
-async function activateJobsMode() {
-    if (!isRelevantJobsContext()) {
-        jobsModeActive = false;
-        return;
-    }
+function installNavigationHooks() {
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
 
-    if (jobsModeActive) {
-        processVisibleJobs().catch(console.error);
-        return;
-    }
+    history.pushState = function (...args) {
+        const result = originalPushState.apply(this, args);
+        setTimeout(() => {
+            lastUrl = location.href;
+            handlePossibleContextChange();
+        }, 0);
+        return result;
+    };
 
-    jobsModeActive = true;
-    console.log("Jobs page detected. Activating scanner.", {
-        href: location.href,
-        top: window === top
+    history.replaceState = function (...args) {
+        const result = originalReplaceState.apply(this, args);
+        setTimeout(() => {
+            lastUrl = location.href;
+            handlePossibleContextChange();
+        }, 0);
+        return result;
+    };
+
+    window.addEventListener("popstate", () => {
+        setTimeout(() => {
+            lastUrl = location.href;
+            handlePossibleContextChange();
+        }, 0);
     });
 
-    startObserver();
-
-    const ready = await waitForJobCardsToAppear();
-
-    if (ready) {
-        processVisibleJobs().catch(console.error);
-    } else {
-        console.log("Jobs never appeared, relying on observer", {
-            href: location.href,
-            top: window === top
-        });
-    }
-}
-
-function monitorUrlChanges() {
     setInterval(() => {
         if (location.href === lastUrl) return;
-
         lastUrl = location.href;
-        console.log("URL changed:", lastUrl);
-
-        if (isRelevantJobsContext()) {
-            activateJobsMode().catch(console.error);
-        } else {
-            jobsModeActive = false;
-        }
-    }, 800);
+        handlePossibleContextChange();
+    }, 1000);
 }
+
+// =====================
+// BOOTSTRAP
+// =====================
 
 async function bootstrap() {
     startObserver();
+    installNavigationHooks();
+
+    currentContextKey = getJobsContextKey();
 
     if (isRelevantJobsContext()) {
-        await activateJobsMode();
+        scheduleEnqueueAndWork();
     }
-
-    monitorUrlChanges();
 }
 
 bootstrap().catch(console.error);
