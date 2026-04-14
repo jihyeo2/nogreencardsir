@@ -443,85 +443,20 @@ async function fetchWithAbort(url, options = {}, controllerKey) {
     }
 }
 
-async function fetchLinkedInJobPage(jobId, generation) {
-    if (isStale(generation)) throw new Error("Stale generation before LinkedIn page fetch");
-
-    const url = `https://www.linkedin.com/jobs/search/?currentJobId=${jobId}`;
-
-    let response;
-    try {
-        response = await fetchWithAbort(
-            url, 
-            { credentials: "include" },
-            `linkedin:${generation}:${jobId}`
-        );
-    } catch (err) {
-        if (String(err).includes("AbortError")) {
-            throw err;
-        }
-        throw new Error(`LinkedIn job page fetch threw before response for job ${jobId}: ${err}`);
-    }
-
-    if (response.status === 429) {
-        throw new Error("HTTP 429 from LinkedIn job page");
-    }
-
-    const html = await response.text();
-
-    if (!response.ok) {
-        throw new Error(`LinkedIn job page fetch failed with status ${response.status}`);
-    }
-
-    return { url, html };
-}
-
-function extractVoyagerApplyInfo(data) {
-    const elements =
-        data?.data?.jobsDashJobPostingDetailSectionsByCardSectionTypes?.elements || [];
-
-    for (const element of elements) {
-        const sections = element?.jobPostingDetailSection || [];
-
-        for (const section of sections) {
-            const applyDetails =
-                section?.topCard?.primaryActionV2?.applyJobAction?.applyJobActionResolutionResult;
-
-            if (applyDetails?.companyApplyUrl) {
-                console.log("Voyager companyApplyUrl found:", applyDetails.companyApplyUrl);
-                console.log("Voyager inPageOffsiteApply:", applyDetails.inPageOffsiteApply);
-                console.log("Voyager onsiteApply:", applyDetails.onsiteApply);
-
-                return {
-                    url: applyDetails.companyApplyUrl,
-                    isExternal:
-                        applyDetails.companyApplyUrl &&
-                        !applyDetails.companyApplyUrl.includes("linkedin.com/job-apply"),
-                    inPageOffsiteApply: applyDetails.inPageOffsiteApply,
-                    onsiteApply: applyDetails.onsiteApply,
-                    applicantTrackingSystemName: applyDetails.applicantTrackingSystemName || null
-                };
-            }
-        }
-    }
-
-    return null;
-}
-
-async function getVoyagerApplyInfo(jobId, generation) {
+async function fetchVoyagerJobPosting(jobId, generation) {
     if (isStale(generation)) throw new Error("Stale generation before Voyager fetch");
 
     const csrfToken = getCsrfToken();
-    const encodedJobPostingUrn = `urn%3Ali%3Afsd_jobPosting%3A${jobId}`;
 
     const url =
         `https://www.linkedin.com/voyager/api/graphql?` +
-        `variables=(cardSectionTypes:List(TOP_CARD,HOW_YOU_FIT_CARD),jobPostingUrn:${encodedJobPostingUrn},includeSecondaryActionsV2:true,jobDetailsContext:(isJobSearch:true))` +
-        `&queryId=voyagerJobsDashJobPostingDetailSections.772cd794c28e3200864f81d143911057`;
+        `variables=(jobPostingUrn:urn%3Ali%3Afsd_jobPosting%3A${jobId})` +
+        `&queryId=voyagerJobsDashJobPostings.891aed7916d7453a37e4bbf5f1f60de4`;
 
     let response;
     try {
         response = await fetchWithAbort(
-            url, 
+            url,
             { 
                 credentials: "include",
                 headers: {
@@ -539,7 +474,7 @@ async function getVoyagerApplyInfo(jobId, generation) {
     }
 
     if (response.status === 429) {
-        throw new Error("HTTP 429 from LinkedIn Voyager API");
+        throw new Error("HTTP 429 from Voyager API");
     }
 
     const text = await response.text();
@@ -547,11 +482,37 @@ async function getVoyagerApplyInfo(jobId, generation) {
     if (!response.ok) {
         console.log("Voyager status:", response.status);
         console.log("Voyager response:", text.slice(0, 500));
-        throw new Error(`Voyager fetch failed with status ${response.status}`);       
+        throw new Error(`Voyager fetch failed with status ${response.status}`);
     }
-    
+
     const data = JSON.parse(text);
-    return extractVoyagerApplyInfo(data);
+    return extractVoyagerJobData(data);
+}
+
+function extractVoyagerJobData(response) {
+    const data = response?.data || [];
+    const jobPosting = data?.jobsDashJobPostingsById || [];
+
+    let description = null;
+    let companyApplyUrl = null;
+    let jobTitle = null;
+
+    if (jobPosting) {
+        description = jobPosting?.description?.text || null;
+        companyApplyUrl = jobPosting?.companyApplyUrl || null;
+        jobTitle = jobPosting?.title || null;
+    }
+
+    console.log(`desc and applyurl for ${jobTitle}`, description, companyApplyUrl, response);
+
+    return {
+        description,
+        companyApplyUrl,
+        jobTitle,
+        isExternal: companyApplyUrl
+            ? !companyApplyUrl.includes("linkedin.com/job-apply")
+            : false
+    };
 }
 
 function fetchExternalPageViaBackground(url) {
@@ -728,41 +689,53 @@ async function checkJob(jobId, generation) {
                 source: "linkedin",
                 phrase: cardMatch.phrase,
                 label: cardMatch.label,
-                url: location.href
+                url: `https://www.linkedin.com/jobs/search/?currentJobId=${jobId}`
             };
         }
     }
 
-    const { url: linkedinUrl, html } = await fetchLinkedInJobPage(jobId, generation);
+    let voyagerData;
+    try {
+        voyagerData = await fetchVoyagerJobPosting(jobId, generation);
+    } catch (err) {
+        console.log(`Voyager fetch failed for ${jobId}:`, err);
+
+        if (isRateLimitError(err)) {
+            throw err;
+        }
+
+        return { matched: false };
+    }
 
     if (isStale(generation)) return { stale: true };
 
+    if (voyagerData?.description) {
+        const linkedinMatch = findRestriction(voyagerData.description);
 
-    const linkedinDoc = parseHtml(html);
-    const linkedinText = getTextFromDoc(linkedinDoc);
-    const linkedinMatch = findRestriction(linkedinText);
-
-    if (linkedinMatch) {
-        return {
-            matched: true,
-            source: "linkedin",
-            phrase: linkedinMatch.phrase,
-            label: linkedinMatch.label,
-            url: linkedinUrl
-        };
+        if (linkedinMatch) {
+            return {
+                matched: true,
+                source: "linkedin",
+                phrase: linkedinMatch.phrase,
+                label: linkedinMatch.label,
+                url: `https://www.linkedin.com/jobs/search/?currentJobId=${jobId}`
+            };
+        }
     }
 
-    const applyInfo = await getVoyagerApplyInfo(jobId, generation);
-
-    if (isStale(generation)) return { stale: true };
-
-    if (!applyInfo || !applyInfo.isExternal || !isLikelyWorthExternalCheck(applyInfo)) {
-        return {
-            matched: false
-        };
+    if (
+        !voyagerData ||
+        !voyagerData.companyApplyUrl ||
+        !voyagerData.isExternal ||
+        !isLikelyWorthExternalCheck({ url: voyagerData.companyApplyUrl, isExternal: true })
+    ) {
+        return { matched: false };
     }
 
-    const externalMatch = await checkExternalApplyPage(applyInfo.url, generation);
+    const externalMatch = await checkExternalApplyPage(
+        voyagerData.companyApplyUrl,
+        generation
+    );
 
     if (isStale(generation)) return { stale: true };
 
@@ -786,6 +759,8 @@ async function checkJob(jobId, generation) {
 async function startWorker(generation) {
     if (isWorkerRunning) return;
     isWorkerRunning = true;
+
+    let isFirstJob = true;
 
     try {
         while (queue.length > 0) {
@@ -847,7 +822,11 @@ async function startWorker(generation) {
                 }
             }
 
-            await sleep(randomDelay(120, 240));
+            if (isFirstJob) {
+                isFirstJob = false;
+            } else {
+                await sleep(randomDelay(120, 240));
+            }
         }
     } finally {
         isWorkerRunning = false;
