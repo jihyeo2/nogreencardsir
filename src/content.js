@@ -21,6 +21,10 @@ let queue = [];
 let queuedJobIds = new Set();
 let isWorkerRunning = false;
 
+const MAX_CONCURRENT = 5;
+let activeWorkers = 0;
+
+const inFlightJobs = new Map();
 let inflightControllers = new Map();
 
 let enqueueTimer = null;
@@ -256,6 +260,25 @@ function markJobCard(jobId, source, phrase) {
     } else {
         job.prepend(badge);
     }
+}
+
+function loadCache() {
+    try {
+        const raw = sessionStorage.getItem("jobResultsCache");
+        if (!raw) return;
+
+        const parsed = JSON.parse(raw);
+        for (const [k, v] of Object.entries(parsed)) {
+            jobResults.set(k, v);
+        }
+    } catch {}
+}
+
+function saveCache() {
+    try {
+        const obj = Object.fromEntries(jobResults);
+        sessionStorage.setItem("jobResultsCache", JSON.stringify(obj));
+    } catch {}
 }
 
 function reapplyBadgeFromCache(jobId) {
@@ -502,8 +525,6 @@ function extractVoyagerJobData(response) {
         companyApplyUrl = jobPosting?.companyApplyUrl || null;
         jobTitle = jobPosting?.title || null;
     }
-
-    console.log(`desc and applyurl for ${jobTitle}`, description, companyApplyUrl, response);
 
     return {
         description,
@@ -752,6 +773,19 @@ async function checkJob(jobId, generation) {
     return { matched: false };
 }
 
+async function checkJobDeduped(jobId, generation) {
+    if (inFlightJobs.has(jobId)) {
+        return inFlightJobs.get(jobId);
+    }
+
+    const promise = checkJob(jobId, generation).finally(() => {
+        inFlightJobs.delete(jobId);
+    });
+
+    inFlightJobs.set(jobId, promise);
+    return promise;
+}
+
 // =====================
 // WORKER
 // =====================
@@ -761,9 +795,10 @@ async function startWorker(generation) {
     isWorkerRunning = true;
 
     let isFirstJob = true;
+    const running = new Set();
 
     try {
-        while (queue.length > 0) {
+        while (queue.length > 0 || running.size > 0) {
             if (isStale(generation)) {
                 console.log("Worker stopping because generation is stale");
                 return;
@@ -774,59 +809,75 @@ async function startWorker(generation) {
                 if (isStale(generation)) return;
             }
 
-            const jobId = queue.shift();
-            queuedJobIds.delete(jobId);
+            while (
+                running.size < MAX_CONCURRENT &&
+                queue.length > 0
+            ) {                
+                const jobId = queue.shift();
+                queuedJobIds.delete(jobId);
+    
+                if (!jobId) continue;
+                if (jobResults.has(jobId)) {
+                    reapplyBadgeFromCache(jobId);
+                    continue;
+                }
+    
+                console.log(`Checking job ${jobId}`, { generation });
 
-            if (!jobId) continue;
-            if (jobResults.has(jobId)) {
-                reapplyBadgeFromCache(jobId);
-                continue;
+                const jobPromise = (async () => {
+                    try {
+                        const result = await checkJobDeduped(jobId, generation);
+
+                        if (result?.stale || isStale(generation)) {
+                            console.log(`Ignoring stale result for ${jobId}`);
+                            return;
+                        }
+
+                        jobResults.set(jobId, result);
+                        saveCache();
+
+                        if (result.matched) {
+                            console.log("Restriction FOUND", {
+                                jobId,
+                                source: result.source,
+                                label: result.label,
+                                phrase: result.phrase,
+                                url: result.url
+                            });
+
+                            markJobCard(jobId, result.source, result.phrase);
+                        } else {
+                            console.log(`No restriction detected for ${jobId}`);
+                        }
+                    } catch (err) {
+                        if (String(err).includes("AbortError")) {
+                            console.log(`Aborted job ${jobId}`);
+                            return;
+                        }
+
+                        console.error(`Failed to check job ${jobId}:`, err); 
+                        
+                        if (isRateLimitError(err)) {
+                            await handleRateLimit(err);
+                        }
+
+                        if (!isStale(generation)) {
+                            jobResults.set(jobId, { matched: false, error: String(err) });
+                            saveCache();
+                        }                        
+                    } finally {
+                        running.delete(jobPromise);
+                    }
+                })();
+
+                running.add(jobPromise);
             }
 
-            console.log(`Checking job ${jobId}`, { generation });
-
-            try {
-                const result = await checkJob(jobId, generation);
-
-                if (result?.stale || isStale(generation)) {
-                    console.log(`Ignoring stale result for ${jobId}`);
-                    return;
-                }
-
-                jobResults.set(jobId, result);
-
-                if (result.matched) {
-                    console.log("Restriction FOUND", {
-                        jobId,
-                        source: result.source,
-                        label: result.label,
-                        phrase: result.phrase,
-                        url: result.url
-                    });
-
-                    markJobCard(jobId, result.source, result.phrase);
-                } else {
-                    console.log(`No restriction detected for ${jobId}`);
-                }
-            } catch (err) {
-                if (String(err).includes("AbortError")) {
-                    console.log(`Aborted job ${jobId}`);
-                    return;
-                }
-
-                console.error(`Failed to check job ${jobId}:`, err);
-                await handleRateLimit(err);
-
-                if (!isStale(generation)) {
-                    jobResults.set(jobId, { matched: false, error: String(err) });
-                }
+            if (running.size > 0) {
+                await Promise.race(running);
             }
 
-            if (isFirstJob) {
-                isFirstJob = false;
-            } else {
-                await sleep(randomDelay(120, 240));
-            }
+            isFirstJob = false;
         }
     } finally {
         isWorkerRunning = false;
@@ -899,6 +950,8 @@ function installNavigationHooks() {
 // =====================
 
 async function bootstrap() {
+    loadCache();
+
     startObserver();
     installNavigationHooks();
 
