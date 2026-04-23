@@ -10,7 +10,7 @@ Since LinkedIn doesn’t provide a filter for this (why?), I built one.
 
 Here’s a quick demo of how it works in real time:
 
-<video src="assets/Demo.mp4" controls width="40%"></video>
+[![Watch Demo](https://img.youtube.com/vi/mY6hpHPqhrw/0.jpg)](https://www.youtube.com/watch?v=mY6hpHPqhrw)
 
 It:
 - scans LinkedIn job listings as you scroll
